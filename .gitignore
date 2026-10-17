@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Secrets & credentials — NEVER commit these
+*.pem
+*.key
+*.p12
+*.json.enc
+credentials.json
+client_secret*.json
+token.json
+token.pickle
+*.keyfile
+homevault.key
+.env
+.env.*
+
+# SQLite databases (contain transfer state, may contain sensitive metadata)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Distribution
+*.tar.gz
+*.zip
+
+# macOS Finder integration build artifacts
+integrations/macos/build/

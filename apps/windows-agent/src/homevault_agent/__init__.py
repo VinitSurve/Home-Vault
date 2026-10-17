@@ -1,0 +1,1 @@
+"""HomeVault Windows receiver agent."""
