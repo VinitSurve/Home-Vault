@@ -1,16 +1,23 @@
-"""Tests for Windows agent CloudDiscoveryManager."""
+"""Tests for Windows agent CloudDiscoveryManager: discovery, download, decryption, disk space, and recovery."""
 
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from homevault_agent.discovery import CloudDiscoveryManager, IntegrityError
+from homevault_agent.discovery import (
+    CloudDiscoveryManager,
+    InsufficientDiskSpaceError,
+    IntegrityError,
+)
 from homevault_protocol.crypto import encrypt_file, generate_key
+from homevault_protocol.database import TransferDatabase
 from homevault_protocol.drive.client import DriveClient
 from homevault_protocol.drive.folders import DriveFolderMap
 from homevault_protocol.hashing import hash_file
 from homevault_protocol.metadata import TransferMetadata
+from homevault_protocol.models import TransferJob, TransferMode, TransferState
 
 
 @pytest.fixture
@@ -21,6 +28,14 @@ def folder_map():
         metadata_id="metadata-3",
         receipts_id="receipts-4",
     )
+
+
+@pytest.fixture
+def db(tmp_path):
+    database = TransferDatabase(tmp_path / "test_receiver.db")
+    database.migrate()
+    yield database
+    database.close()
 
 
 class TestCloudDiscoveryManager:
@@ -54,10 +69,9 @@ class TestCloudDiscoveryManager:
         assert pending[0].transfer_id == "job-2"
         drive_client.read_json_file.assert_called_once_with("m2")
 
-    def test_download_and_verify_success(self, tmp_path, folder_map):
+    def test_download_and_verify_success_with_db(self, tmp_path, folder_map, db):
         inbox = tmp_path / "inbox"
         inbox.mkdir()
-        temp_dir = tmp_path / "temp"
 
         # Prepare a plaintext file and encrypt it
         plaintext = tmp_path / "original.txt"
@@ -79,9 +93,11 @@ class TestCloudDiscoveryManager:
 
         drive_client = MagicMock(spec=DriveClient)
         drive_client.ensure_folders.return_value = folder_map
-        drive_client.find_file.return_value = {"id": "staged-drive-id"}
+        drive_client.find_file.side_effect = [
+            {"id": "staged-drive-id"},  # find staged file
+            {"id": "staged-drive-id"},  # find staged for cleanup
+        ]
 
-        # When download_file_resumable is called, copy our encrypted file to dest_path
         def mock_download(file_id, dest_path, **kwargs):
             dest_path.write_bytes(encrypted.read_bytes())
 
@@ -91,7 +107,8 @@ class TestCloudDiscoveryManager:
         manager = CloudDiscoveryManager(
             drive_client=drive_client,
             inbox_dir=inbox,
-            temp_dir=temp_dir,
+            database=db,
+            cleanup_cloud_after_receipt=True,
         )
 
         final_path, receipt = manager.download_and_verify(metadata, encryption_key=key)
@@ -101,22 +118,186 @@ class TestCloudDiscoveryManager:
         assert receipt.transfer_id == "transfer-123"
         assert receipt.sha256_hash == expected_hash
 
-        # Receipt should have been uploaded to Receipts folder
-        drive_client.upload_json_data.assert_called_once()
-        args, kwargs = drive_client.upload_json_data.call_args
-        assert kwargs["parent_id"] == folder_map.receipts_id
-        assert kwargs["name"] == "transfer-123.json"
+        # Verify SQLite persistent job record
+        job = db.get("transfer-123")
+        assert job is not None
+        assert job.state == TransferState.COMPLETED
+        assert job.dest_path == str(final_path)
 
-    def test_download_and_verify_tampered_fails(self, tmp_path, folder_map):
+        # Receipt uploaded to Drive and cloud blob deleted
+        drive_client.upload_json_data.assert_called_once()
+        drive_client.delete_file.assert_called_once_with("staged-drive-id")
+
+    def test_duplicate_filename_preserves_existing_without_overwrite(self, tmp_path, folder_map, db):
         inbox = tmp_path / "inbox"
         inbox.mkdir()
 
+        # Existing file in inbox
+        existing_file = inbox / "document.pdf"
+        existing_file.write_bytes(b"Pre-existing local document")
+
+        # New file with same name
+        plaintext = tmp_path / "new.pdf"
+        plaintext.write_bytes(b"Incoming new document from Mac")
+        expected_hash = hash_file(plaintext)
         key = generate_key()
+
+        encrypted = tmp_path / "new.enc"
+        encrypt_file(plaintext, encrypted, key)
+
         metadata = TransferMetadata(
-            transfer_id="transfer-corrupt",
+            transfer_id="transfer-dup-1",
             mode="copy",
-            filename="corrupt.txt",
-            file_size=10,
+            filename="document.pdf",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(encrypted.read_bytes())
+        )
+        drive_client.upload_json_data.return_value = "r-id"
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+            cleanup_cloud_after_receipt=False,
+        )
+
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key)
+
+        # Existing file was NOT overwritten
+        assert existing_file.read_bytes() == b"Pre-existing local document"
+        # New file was placed with non-colliding name
+        assert final_path == inbox / "document (1).pdf"
+        assert final_path.read_bytes() == b"Incoming new document from Mac"
+
+    def test_path_traversal_sanitized(self, tmp_path, folder_map, db):
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        plaintext = tmp_path / "evil.txt"
+        plaintext.write_bytes(b"Attempted traversal payload")
+        expected_hash = hash_file(plaintext)
+        key = generate_key()
+
+        encrypted = tmp_path / "evil.enc"
+        encrypt_file(plaintext, encrypted, key)
+
+        metadata = TransferMetadata(
+            transfer_id="transfer-traversal",
+            mode="copy",
+            filename="../../Windows/System32/evil.dll",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(encrypted.read_bytes())
+        )
+        drive_client.upload_json_data.return_value = "r-id"
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+            cleanup_cloud_after_receipt=False,
+        )
+
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key)
+
+        # Must be strictly within inbox
+        assert final_path.parent == inbox
+        assert final_path.name == "evil.dll"
+
+    def test_insufficient_disk_space_aborts(self, tmp_path, folder_map, db):
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        metadata = TransferMetadata(
+            transfer_id="transfer-huge",
+            mode="copy",
+            filename="huge.iso",
+            file_size=100 * 1024 * 1024 * 1024,  # 100 GB
+            sha256_hash="abc",
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        drive_client = MagicMock(spec=DriveClient)
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+        )
+
+        # Mock disk usage returning 1 GB free
+        with patch("shutil.disk_usage", return_value=MagicMock(free=1024 * 1024 * 1024)):
+            with pytest.raises(InsufficientDiskSpaceError):
+                manager.download_and_verify(metadata, encryption_key=generate_key())
+
+        drive_client.download_file_resumable.assert_not_called()
+
+    def test_dry_run_mode_verifies_without_commit(self, tmp_path, folder_map, db):
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        plaintext = tmp_path / "test.txt"
+        plaintext.write_bytes(b"Dry run validation")
+        expected_hash = hash_file(plaintext)
+        key = generate_key()
+
+        encrypted = tmp_path / "test.enc"
+        encrypt_file(plaintext, encrypted, key)
+
+        metadata = TransferMetadata(
+            transfer_id="transfer-dry",
+            mode="copy",
+            filename="test.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(encrypted.read_bytes())
+        )
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+        )
+
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key, dry_run=True)
+
+        assert final_path is None
+        assert receipt is None
+        # No files written to inbox
+        assert len(list(inbox.glob("*.txt"))) == 0
+        # No receipt uploaded to Drive
+        drive_client.upload_json_data.assert_not_called()
+
+    def test_tampered_ciphertext_fails_integrity(self, tmp_path, folder_map, db):
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        metadata = TransferMetadata(
+            transfer_id="transfer-tampered",
+            mode="copy",
+            filename="tampered.bin",
+            file_size=16,
             sha256_hash="0000000000000000000000000000000000000000000000000000000000000000",
             created_at="2026-01-01T00:00:00Z",
         )
@@ -124,23 +305,69 @@ class TestCloudDiscoveryManager:
         drive_client = MagicMock(spec=DriveClient)
         drive_client.ensure_folders.return_value = folder_map
         drive_client.find_file.return_value = {"id": "staged-id"}
-
-        # Return garbage bytes
-        def mock_download(file_id, dest_path, **kwargs):
-            dest_path.write_bytes(b"garbage-bytes-not-encrypted")
-
-        drive_client.download_file_resumable.side_effect = mock_download
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(b"corrupt-data-not-gcm")
+        )
 
         manager = CloudDiscoveryManager(
             drive_client=drive_client,
             inbox_dir=inbox,
-            temp_dir=tmp_path / "temp",
+            database=db,
         )
 
         with pytest.raises(IntegrityError):
-            manager.download_and_verify(metadata, encryption_key=key)
+            manager.download_and_verify(metadata, encryption_key=generate_key())
 
-        # Nothing should be committed to inbox
-        assert len(list(inbox.iterdir())) == 0
-        # No receipt uploaded
+        # No user file in inbox
+        user_files = [p for p in inbox.iterdir() if not p.name.startswith(".")]
+        assert len(user_files) == 0
         drive_client.upload_json_data.assert_not_called()
+
+        # Job in database flagged with failure
+        job = db.get("transfer-tampered")
+        assert job is not None
+        assert job.retry_count == 1
+
+    def test_restart_recovery_for_locally_completed_job(self, tmp_path, folder_map, db):
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        # Existing delivered file in Inbox
+        delivered = inbox / "already_done.pdf"
+        delivered.write_bytes(b"Delivered content")
+
+        # Job already marked COMPLETED in local SQLite
+        job = TransferJob(
+            transfer_id="transfer-rec-1",
+            mode=TransferMode.COPY,
+            state=TransferState.COMPLETED,
+            filename="already_done.pdf",
+            file_size=len("Delivered content"),
+            sha256_hash=hash_file(delivered),
+            dest_path=str(delivered),
+        )
+        db.insert(job)
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        # No receipts on Drive yet (e.g. power lost right before upload)
+        drive_client.list_files_in_folder.side_effect = [
+            [],  # Receipts folder
+            [{"id": "m1", "name": "transfer-rec-1.json"}],  # Metadata folder
+        ]
+        drive_client.find_file.return_value = {"id": "staged-id"}
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+            cleanup_cloud_after_receipt=True,
+        )
+
+        # Polling should detect local completion and recover receipt to Drive
+        pending = manager.discover_pending_transfers()
+        assert len(pending) == 0
+
+        # Receipt uploaded to Drive and cloud blob purged
+        drive_client.upload_json_data.assert_called_once()
+        drive_client.delete_file.assert_called_once_with("staged-id")

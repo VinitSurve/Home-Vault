@@ -2,17 +2,22 @@
 
 Coordinates:
 - Independent discovery of pending transfers by querying HomeVault/Metadata/.
-- Deduplication against existing receipts in HomeVault/Receipts/.
+- Deduplication against existing receipts on Google Drive and local SQLite DB.
+- Pre-download disk space checks on the Inbox volume.
 - Resumable download of encrypted staged payloads.
 - Authenticated decryption (AES-256-GCM) and streaming SHA-256 integrity verification.
-- Path traversal prevention, safe filename resolution, and non-colliding commit to Inbox.
+- Safe path resolution preventing directory traversal and resolving name collisions.
+- Same-volume atomic commit to the configured Inbox directory.
+- Durable SQLite state transitions and recovery after crashes or reboots.
 - Generation and upload of completion receipts to HomeVault/Receipts/.
+- Safe post-delivery cleanup of cloud staging blobs.
 """
 
 from __future__ import annotations
 
 import logging
-import tempfile
+import os
+import shutil
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -22,14 +27,21 @@ from homevault_protocol.drive.client import DriveClient
 from homevault_protocol.filenames import resolve_destination
 from homevault_protocol.hashing import hash_file
 from homevault_protocol.metadata import CompletionReceipt, TransferMetadata
+from homevault_protocol.models import TransferJob, TransferMode, TransferState
+from homevault_protocol.state_machine import TransferStateMachine
 
 logger = logging.getLogger(__name__)
 
 STREAMING_THRESHOLD_BYTES = 50 * 1024 * 1024  # 50 MB threshold for chunked decryption
+DISK_MARGIN_BYTES = 20 * 1024 * 1024  # 20 MB safety buffer above required space
 
 
 class IntegrityError(Exception):
     """Raised when downloaded file fails SHA-256 checksum or authenticated decryption."""
+
+
+class InsufficientDiskSpaceError(Exception):
+    """Raised when the target drive lacks sufficient free space for download and decryption."""
 
 
 class CloudDiscoveryManager:
@@ -38,16 +50,37 @@ class CloudDiscoveryManager:
     def __init__(
         self,
         drive_client: DriveClient,
-        inbox_dir: Path,
+        inbox_dir: str | Path,
         database: Optional[TransferDatabase] = None,
-        temp_dir: Optional[Path] = None,
+        temp_dir: Optional[str | Path] = None,
+        cleanup_cloud_after_receipt: bool = True,
     ) -> None:
         self.drive_client = drive_client
-        self.inbox_dir = Path(inbox_dir)
+        self.inbox_dir = Path(inbox_dir).resolve()
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
         self.database = database
-        self.temp_dir = Path(temp_dir) if temp_dir else Path(tempfile.gettempdir()) / "homevault_agent"
+        self.cleanup_cloud_after_receipt = cleanup_cloud_after_receipt
+
+        # Place staging on the same filesystem as inbox_dir to ensure atomic os.replace
+        if temp_dir:
+            self.temp_dir = Path(temp_dir).resolve()
+        else:
+            self.temp_dir = self.inbox_dir / ".homevault_staging"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+
+    def check_disk_space(self, required_bytes: int) -> None:
+        """Verify that sufficient disk space exists for both encrypted and decrypted files."""
+        # Need space for encrypted blob + decrypted payload + safety margin
+        total_needed = (required_bytes * 2) + DISK_MARGIN_BYTES
+        try:
+            usage = shutil.disk_usage(self.inbox_dir)
+            if usage.free < total_needed:
+                raise InsufficientDiskSpaceError(
+                    f"Insufficient disk space on {self.inbox_dir}: "
+                    f"requires {total_needed} bytes, only {usage.free} bytes available."
+                )
+        except OSError as e:
+            logger.warning("Could not query disk space on %s: %s", self.inbox_dir, e)
 
     def discover_pending_transfers(self) -> list[TransferMetadata]:
         """Discover all pending transfers from Drive metadata not yet acknowledged.
@@ -57,15 +90,15 @@ class CloudDiscoveryManager:
         """
         folder_map = self.drive_client.ensure_folders()
 
-        # 1. Fetch existing receipts to filter out completed transfers
+        # 1. Fetch existing receipts on Drive to filter out completed transfers
         receipt_files = self.drive_client.list_files_in_folder(folder_map.receipts_id)
-        completed_ids = {
+        completed_cloud_ids = {
             f["name"][:-5]
             for f in receipt_files
             if f["name"].endswith(".json")
         }
 
-        # 2. Fetch metadata records
+        # 2. Fetch metadata records from Drive
         metadata_files = self.drive_client.list_files_in_folder(folder_map.metadata_id)
         pending: list[TransferMetadata] = []
 
@@ -74,8 +107,21 @@ class CloudDiscoveryManager:
                 continue
 
             transfer_id = meta_file["name"][:-5]
-            if transfer_id in completed_ids:
-                continue  # Already finished and receipted
+            if transfer_id in completed_cloud_ids:
+                continue  # Already finished and confirmed on Drive
+
+            # 3. Check local database for recovery if receipt upload failed previously
+            if self.database:
+                local_job = self.database.get(transfer_id)
+                if local_job and local_job.state == TransferState.COMPLETED:
+                    if local_job.dest_path and Path(local_job.dest_path).exists():
+                        # File already delivered! Idempotently re-upload receipt to Drive
+                        logger.info(
+                            "Job %s was completed locally; recovering missing cloud receipt.",
+                            transfer_id,
+                        )
+                        self._upload_receipt_from_local_job(local_job)
+                        continue
 
             try:
                 raw_data = self.drive_client.read_json_file(meta_file["id"])
@@ -91,21 +137,27 @@ class CloudDiscoveryManager:
         metadata: TransferMetadata,
         encryption_key: str,
         progress_callback: Optional[Callable[[int, int], None]] = None,
-    ) -> tuple[Path, CompletionReceipt]:
+        dry_run: bool = False,
+    ) -> tuple[Optional[Path], Optional[CompletionReceipt]]:
         """Download, decrypt, verify, safely store a transfer, and issue a receipt.
 
         Args:
             metadata: TransferMetadata for the pending job.
             encryption_key: Base64-encoded AES-256 decryption key.
             progress_callback: Optional callback receiving (bytes_downloaded, total_bytes).
+            dry_run: If True, simulate download/decrypt without committing to Inbox or Drive.
 
         Returns:
-            Tuple of (final_destination_path, CompletionReceipt).
+            Tuple of (final_destination_path, CompletionReceipt), or (None, None) if dry-run.
 
         Raises:
             FileNotFoundError: If the staged payload is absent on Drive.
             IntegrityError: If decryption fails or SHA-256 mismatch is detected.
+            InsufficientDiskSpaceError: If the destination volume is out of space.
         """
+        # 1. Assert sufficient disk space
+        self.check_disk_space(metadata.file_size)
+
         folder_map = self.drive_client.ensure_folders()
         staged_filename = f"{metadata.transfer_id}.enc"
         remote_staged = self.drive_client.find_file(staged_filename, folder_map.staging_id)
@@ -115,18 +167,33 @@ class CloudDiscoveryManager:
                 f"Staged file {staged_filename} not found on Google Drive in Staging/."
             )
 
+        # 2. Record or update persistent job in local SQLite database
+        job = self._init_or_update_local_job(metadata)
+
         enc_path = self.temp_dir / f"{metadata.transfer_id}.enc"
         dec_path = self.temp_dir / f"{metadata.transfer_id}.dec"
 
         try:
-            # 1. Download encrypted payload in chunks
+            # 3. Transition to DOWNLOADING
+            if job:
+                TransferStateMachine.transition(job, TransferState.DOWNLOADING)
+                if self.database:
+                    self.database.update(job)
+
+            # 4. Download encrypted payload in chunks with retries
             self.drive_client.download_file_resumable(
                 file_id=remote_staged["id"],
                 dest_path=enc_path,
                 progress_callback=progress_callback,
             )
 
-            # 2. Authenticated decryption
+            # 5. Transition to VERIFYING
+            if job:
+                TransferStateMachine.transition(job, TransferState.VERIFYING)
+                if self.database:
+                    self.database.update(job)
+
+            # 6. Authenticated decryption
             try:
                 if metadata.file_size > STREAMING_THRESHOLD_BYTES:
                     decrypt_file_streaming(enc_path, dec_path, encryption_key)
@@ -134,10 +201,11 @@ class CloudDiscoveryManager:
                     decrypt_file(enc_path, dec_path, encryption_key)
             except Exception as err:
                 raise IntegrityError(
-                    f"Decryption failed for transfer {metadata.transfer_id}: invalid key or corrupted ciphertext. ({err})"
+                    f"Decryption failed for transfer {metadata.transfer_id}: "
+                    f"invalid key or corrupted ciphertext. ({err})"
                 ) from err
 
-            # 3. SHA-256 integrity verification
+            # 7. SHA-256 integrity verification
             actual_hash = hash_file(dec_path)
             if actual_hash.lower() != metadata.sha256_hash.lower():
                 raise IntegrityError(
@@ -145,13 +213,18 @@ class CloudDiscoveryManager:
                     f"expected {metadata.sha256_hash}, got {actual_hash}."
                 )
 
-            # 4. Safe destination resolution with traversal prevention & deduplication
+            # In dry-run mode, stop here and report verification success
+            if dry_run:
+                logger.info("[Dry Run] Verified transfer %s (%s)", metadata.transfer_id, metadata.filename)
+                return None, None
+
+            # 8. Safe destination resolution with traversal prevention & deduplication
             final_path = resolve_destination(self.inbox_dir, metadata.filename)
 
-            # 5. Atomic commit to final Inbox path
-            dec_path.replace(final_path)
+            # 9. Atomic commit to final Inbox path
+            self._commit_to_inbox(dec_path, final_path)
 
-            # 6. Issue completion receipt and upload to Drive
+            # 10. Issue completion receipt and upload to Drive
             receipt = CompletionReceipt(
                 transfer_id=metadata.transfer_id,
                 final_path=str(final_path),
@@ -160,17 +233,101 @@ class CloudDiscoveryManager:
                 receiver_platform="windows",
             )
             receipt_filename = f"{metadata.transfer_id}.json"
-            self.drive_client.upload_json_data(
+            receipt_id = self.drive_client.upload_json_data(
                 name=receipt_filename,
                 parent_id=folder_map.receipts_id,
                 json_content=receipt.to_json(),
             )
 
+            # 11. Mark job COMPLETED in SQLite
+            if job:
+                TransferStateMachine.transition(job, TransferState.COMPLETED)
+                job.dest_path = str(final_path)
+                job.drive_receipt_id = receipt_id
+                if self.database:
+                    self.database.update(job)
+
+            # 12. Cleanup staged encrypted blob from Drive now that receipt is durable
+            if self.cleanup_cloud_after_receipt:
+                try:
+                    self.cleanup_staged_blob(metadata.transfer_id)
+                except Exception as e:
+                    logger.warning("Could not delete cloud staged blob %s: %s", metadata.transfer_id, e)
+
             return final_path, receipt
+
+        except Exception as err:
+            logger.error("Error processing transfer %s: %s", metadata.transfer_id, err)
+            if job:
+                job.retry_count += 1
+                new_state = (
+                    TransferState.FAILED
+                    if job.retry_count >= job.max_retries
+                    else TransferState.QUEUED
+                )
+                try:
+                    TransferStateMachine.transition(job, new_state, error_message=str(err))
+                except Exception:
+                    job.state = new_state
+                    job.error_message = str(err)
+                if self.database:
+                    self.database.update(job)
+            raise
 
         finally:
             enc_path.unlink(missing_ok=True)
             dec_path.unlink(missing_ok=True)
+
+    def _commit_to_inbox(self, src: Path, dest: Path) -> None:
+        """Atomically commit the decrypted file to the final path and set safe permissions."""
+        try:
+            # Atomic rename (fastest & atomic on same volume)
+            os.replace(src, dest)
+        except OSError:
+            # Fallback across different filesystems
+            shutil.move(str(src), str(dest))
+
+        # Ensure file is not executable (standard readable/writable data file)
+        try:
+            os.chmod(dest, 0o644)
+        except (OSError, NotImplementedError):
+            pass
+
+    def _init_or_update_local_job(self, metadata: TransferMetadata) -> Optional[TransferJob]:
+        """Fetch or initialize a TransferJob in the local database."""
+        if not self.database:
+            return None
+
+        job = self.database.get(metadata.transfer_id)
+        if job is None:
+            job = TransferJob(
+                transfer_id=metadata.transfer_id,
+                mode=TransferMode(metadata.mode),
+                state=TransferState.QUEUED,
+                filename=metadata.filename,
+                file_size=metadata.file_size,
+                sha256_hash=metadata.sha256_hash,
+            )
+            self.database.insert(job)
+        return job
+
+    def _upload_receipt_from_local_job(self, job: TransferJob) -> None:
+        """Upload a receipt to Drive using metadata from a locally completed job."""
+        folder_map = self.drive_client.ensure_folders()
+        receipt = CompletionReceipt(
+            transfer_id=job.transfer_id,
+            final_path=job.dest_path or "",
+            file_size=job.file_size,
+            sha256_hash=job.sha256_hash,
+            receiver_platform="windows",
+        )
+        self.drive_client.upload_json_data(
+            name=f"{job.transfer_id}.json",
+            parent_id=folder_map.receipts_id,
+            json_content=receipt.to_json(),
+        )
+        if self.cleanup_cloud_after_receipt:
+            self.cleanup_staged_blob(job.transfer_id)
 
     def cleanup_staged_blob(self, transfer_id: str) -> bool:
         """Purge the staged encrypted blob from Google Drive after delivery."""

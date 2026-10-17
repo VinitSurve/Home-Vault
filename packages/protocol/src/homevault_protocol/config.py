@@ -69,3 +69,72 @@ def load_config_file(path: Optional[str | Path] = None) -> dict:
         return {}
     with open(path, "rb") as f:
         return tomllib.load(f)
+
+
+def get_receiver_config(path: Optional[str | Path] = None) -> ReceiverConfig:
+    """Load ReceiverConfig from TOML file, populating missing values with defaults."""
+    raw = load_config_file(path)
+    rec_dict = raw.get("receiver", {})
+    drive_dict = raw.get("drive", {})
+    trans_dict = raw.get("transfer", {})
+
+    drive = DriveConfig(
+        root_folder_name=drive_dict.get("root_folder_name", "HomeVault"),
+        staging_folder_name=drive_dict.get("staging_folder_name", "Staging"),
+        metadata_folder_name=drive_dict.get("metadata_folder_name", "Metadata"),
+        receipts_folder_name=drive_dict.get("receipts_folder_name", "Receipts"),
+        credentials_file=drive_dict.get("credentials_file", str(_DEFAULT_CONFIG_DIR / "credentials.json")),
+    )
+
+    transfer = TransferConfig(
+        max_retries=trans_dict.get("max_retries", 5),
+        retry_base_delay_seconds=trans_dict.get("retry_base_delay_seconds", 2.0),
+        retry_max_delay_seconds=trans_dict.get("retry_max_delay_seconds", 300.0),
+        poll_interval_seconds=trans_dict.get("poll_interval_seconds", 60.0),
+        upload_chunk_size_bytes=trans_dict.get("upload_chunk_size_bytes", 10 * 1024 * 1024),
+        streaming_encryption_threshold_bytes=trans_dict.get(
+            "streaming_encryption_threshold_bytes", 100 * 1024 * 1024
+        ),
+    )
+
+    return ReceiverConfig(
+        inbox_path=rec_dict.get("inbox_path", "D:\\HomeVault\\Inbox"),
+        db_path=rec_dict.get("db_path", str(_DEFAULT_CONFIG_DIR / "receiver.db")),
+        drive=drive,
+        transfer=transfer,
+        cleanup_completed_after_days=rec_dict.get("cleanup_completed_after_days", 7),
+        cleanup_delete_cloud_files=rec_dict.get("cleanup_delete_cloud_files", True),
+    )
+
+
+def get_sender_config(path: Optional[str | Path] = None) -> SenderConfig:
+    """Load SenderConfig from TOML file, populating missing values with defaults."""
+    raw = load_config_file(path)
+    send_dict = raw.get("sender", {})
+    drive_dict = raw.get("drive", {})
+    trans_dict = raw.get("transfer", {})
+
+    drive = DriveConfig(
+        root_folder_name=drive_dict.get("root_folder_name", "HomeVault"),
+        staging_folder_name=drive_dict.get("staging_folder_name", "Staging"),
+        metadata_folder_name=drive_dict.get("metadata_folder_name", "Metadata"),
+        receipts_folder_name=drive_dict.get("receipts_folder_name", "Receipts"),
+        credentials_file=drive_dict.get("credentials_file", str(_DEFAULT_CONFIG_DIR / "credentials.json")),
+    )
+
+    transfer = TransferConfig(
+        max_retries=trans_dict.get("max_retries", 5),
+        retry_base_delay_seconds=trans_dict.get("retry_base_delay_seconds", 2.0),
+        retry_max_delay_seconds=trans_dict.get("retry_max_delay_seconds", 300.0),
+        poll_interval_seconds=trans_dict.get("poll_interval_seconds", 60.0),
+        upload_chunk_size_bytes=trans_dict.get("upload_chunk_size_bytes", 10 * 1024 * 1024),
+        streaming_encryption_threshold_bytes=trans_dict.get(
+            "streaming_encryption_threshold_bytes", 100 * 1024 * 1024
+        ),
+    )
+
+    return SenderConfig(
+        db_path=send_dict.get("db_path", str(_DEFAULT_CONFIG_DIR / "sender.db")),
+        drive=drive,
+        transfer=transfer,
+    )
