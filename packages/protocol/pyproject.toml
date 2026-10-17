@@ -9,6 +9,11 @@ description = "HomeVault shared transfer protocol — models, state machine, cry
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=41.0",
+    "google-api-python-client>=2.100.0",
+    "google-auth>=2.20.0",
+    "google-auth-oauthlib>=1.0.0",
+    "google-auth-httplib2>=0.2.0",
+    "keyring>=24.0.0",
 ]
 
 [project.optional-dependencies]

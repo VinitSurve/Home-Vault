@@ -36,6 +36,8 @@ _TRANSITIONS: dict[TransferState, set[TransferState]] = {
     },
     TransferState.QUEUED: {
         TransferState.DOWNLOADING,
+        TransferState.VERIFYING,
+        TransferState.COMPLETED,
         TransferState.FAILED,
         TransferState.CANCELLED,
     },

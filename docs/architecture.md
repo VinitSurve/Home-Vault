@@ -39,35 +39,34 @@ Platform-independent code shared by both sender and receiver:
 | `models.py` | Transfer job dataclass, transfer modes (Copy/Move), state enum |
 | `state_machine.py` | Valid state transitions, transition validation |
 | `hashing.py` | SHA-256 streaming file hashing |
-| `crypto.py` | AES-256-GCM authenticated encryption/decryption |
+| `crypto.py` | AES-256-GCM authenticated encryption/decryption (streaming + chunked) |
 | `metadata.py` | Transfer metadata and receipt JSON schemas |
 | `filenames.py` | Safe filename sanitization, deduplication, path-traversal prevention |
 | `database.py` | SQLite helpers, migration framework |
 | `config.py` | Shared configuration model |
+| `drive/auth.py` | OAuth 2.0 flow, token storage in OS keyring (macOS Keychain / Windows Credential Manager) |
+| `drive/folders.py` | HomeVault application folder hierarchy (Staging, Metadata, Receipts) |
+| `drive/client.py` | Google Drive v3 client: storage quota checks, resumable upload/download with exponential backoff |
 
 ### `apps/mac-sender/` — macOS sender
 
 | Module | Responsibility |
 |---|---|
-| `queue.py` | Enqueue new transfer jobs from Finder |
-| `worker.py` | Background daemon: process upload queue |
-| `drive_upload.py` | Google Drive resumable upload with retries |
-| `move_handler.py` | Receipt monitoring and safe original deletion |
-| `oauth.py` | OAuth 2.0 flow, token storage in macOS Keychain |
-| `notifications.py` | macOS notification center integration |
-| `cli.py` | Command-line interface for manual operations |
+| `staging.py` | Cloud staging manager: quota validation, AES-256-GCM encryption, Drive upload, safe Move finalization |
+| `oauth.py` | macOS interactive OAuth CLI helper |
+| `queue.py` | Enqueue new transfer jobs from Finder (Phase 4) |
+| `worker.py` | Background daemon: process upload queue (Phase 4) |
+| `notifications.py` | macOS notification center integration (Phase 4) |
+| `cli.py` | Command-line interface for manual operations (Phase 4) |
 
 ### `apps/windows-agent/` — Windows receiver
 
 | Module | Responsibility |
 |---|---|
-| `poller.py` | Discover pending transfers on Google Drive |
-| `downloader.py` | Download and decrypt staged files |
-| `verifier.py` | Hash verification and integrity checks |
-| `finalizer.py` | Safe file placement, duplicate handling |
-| `receipts.py` | Generate and upload completion receipts |
-| `oauth.py` | OAuth 2.0 flow, token storage in Windows Credential Manager |
-| `service.py` | Windows startup integration (Task Scheduler) |
+| `discovery.py` | Cloud discovery manager: pending job discovery, download, decryption, integrity validation, receipt issuance |
+| `oauth.py` | Windows interactive OAuth CLI helper |
+| `poller.py` | Continuous background polling loop (Phase 3) |
+| `service.py` | Windows startup integration (Task Scheduler) (Phase 3) |
 
 ### `integrations/macos/` — Finder integration
 

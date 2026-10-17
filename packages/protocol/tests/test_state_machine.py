@@ -29,6 +29,8 @@ class TestTransitionTable:
     def test_queued_transitions(self):
         allowed = TransferStateMachine.allowed_transitions(TransferState.QUEUED)
         assert TransferState.DOWNLOADING in allowed
+        assert TransferState.VERIFYING in allowed
+        assert TransferState.COMPLETED in allowed
         assert TransferState.FAILED in allowed
         assert TransferState.CANCELLED in allowed
 

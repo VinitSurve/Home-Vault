@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "homevault-agent"
+version = "0.1.0"
+description = "HomeVault Windows receiver agent and discovery interface"
+requires-python = ">=3.11"
+dependencies = [
+    "homevault-protocol",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
