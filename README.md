@@ -34,12 +34,66 @@ HomeVault/
 
 See [docs/setup.md](docs/setup.md) for detailed setup instructions.
 
+### macOS Sender CLI
+
+The macOS sender provides the `homevault` command-line interface for submitting files, inspecting queue status, and running the background worker daemon:
+
+```bash
+# Queue a file for Copy (keeps original file on Mac)
+homevault copy ~/Documents/Report.pdf
+
+# Queue a file for Move (deletes original ONLY after verified Windows delivery)
+homevault move ~/Downloads/Archive.zip
+
+# Send multiple files at once
+homevault send --mode move ~/Pictures/*.png
+
+# Check the local queue status
+homevault status
+
+# Retry a failed transfer or cancel a pending job
+homevault retry <transfer-id>
+homevault cancel <transfer-id>
+
+# Run worker manually (single iteration or daemon)
+homevault worker --once
+homevault worker --interval 10
+```
+
+### macOS Finder Quick Action
+
+Right-click any file in macOS Finder, choose **Quick Actions** → **Send to HomeVault**, select **Copy to Windows** or **Move to Windows**, and the file is queued immediately with macOS notifications. See [integrations/macos/README.md](integrations/macos/README.md) for the setup recipe.
+
+### macOS Background Daemon (`launchd`)
+
+HomeVault includes a user agent that automatically starts at login and manages background uploads and receipts:
+
+```bash
+# Install and start launchd agent
+./scripts/install_mac_launchd.sh
+
+# Stop and uninstall launchd agent
+./scripts/uninstall_mac_launchd.sh
+
+# View worker logs
+tail -f ~/.homevault/logs/worker.log
+```
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
 - [Security](docs/security.md)
 - [Setup Guide](docs/setup.md)
+- [Windows Receiver Guide](docs/windows_setup.md)
+- [macOS Finder Integration](integrations/macos/README.md)
 
 ## Status
 
-🚧 **In development** — See [CHANGELOG.md](CHANGELOG.md) for progress.
+- Phase 0: Project planning and architecture specifications (Completed)
+- Phase 1: Shared protocol foundation, models, SQLite WAL, and crypto (Completed)
+- Phase 2: Google Drive v3 staging, resumable transfers, and discovery (Completed)
+- Phase 3: Windows receiver agent, atomic commit, and Task Scheduler (Completed)
+- Phase 4: macOS sender CLI, persistent queue, launchd daemon, and Finder Quick Action (Completed)
+- Phase 5: End-to-end integration testing and operational polish (Next)
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.

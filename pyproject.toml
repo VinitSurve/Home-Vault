@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+pythonpath = [
+    "packages/protocol/src",
+    "apps/mac-sender/src",
+    "apps/windows-agent/src"
+]
+testpaths = [
+    "packages/protocol/tests",
+    "apps/mac-sender/tests",
+    "apps/windows-agent/tests",
+    "tests"
+]
+addopts = "-v --import-mode=importlib"

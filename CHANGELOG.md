@@ -36,3 +36,13 @@ All notable changes to HomeVault will be documented in this file.
 - Windows Task Scheduler integration scripts (`install_windows_task.ps1` and `uninstall_windows_task.ps1`) for logon auto-start.
 - Complete Windows operations and security guide (`docs/windows_setup.md`).
 - Extended test suite (160 passed, 1 skipped live integration test).
+
+### Phase 4 — macOS Sender and Finder Quick Action
+- Built complete `homevault` CLI supporting `send`, `copy`, `move`, `status`, `cancel`, `retry`, and `worker` daemon.
+- Created durable `SenderQueue` backed by SQLite with restart recovery, tracking queued, pending upload, and completed states.
+- Implemented `SenderWorker` daemon for background staging, exponential backoff retries, completion receipt polling, and cloud blob cleanup.
+- Safe non-destructive Move semantics: verifies `CompletionReceipt` against metadata, checks source file presence, and re-computes `sha256(source)` prior to unlinking original file; flags `NEEDS_ATTENTION` and retains file if source changed or receipt mismatched.
+- Native macOS Notification Center integration via AppleScript (`osascript`) notifying users on queueing, staging completion, delivery confirmation, and safety alerts.
+- Configured macOS `launchd` User Agent (`com.vinit.homevault.sender.plist`) for automatic startup at login, with safe installation (`scripts/install_mac_launchd.sh`) and removal (`scripts/uninstall_mac_launchd.sh`) scripts.
+- Provided Apple Shortcuts Finder Quick Action recipe and bridge script (`integrations/macos/send_to_homevault.sh`) for instant right-click context menu submission without blocking Finder.
+- Expanded monorepo test suite with comprehensive unit and integration tests (196 passed, 1 skipped live integration test).

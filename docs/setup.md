@@ -195,33 +195,97 @@ New-Item -ItemType Directory -Force -Path "D:\HomeVault\Inbox"
 
 ---
 
-## Step 6: Start the Services
+## Step 6: Set Up macOS CLI and Background Worker
 
-### macOS — Background worker
+### 6.1 Create the CLI executable wrapper
+
+Run the setup script from the repository root:
 
 ```bash
-# Manual start
-cd apps/mac-sender && source .venv/bin/activate
-python -m homevault_sender.worker
-
-# Auto-start at login (launchd) — see scripts/install_mac_launchd.sh
+./scripts/setup_mac_cli.sh
 ```
 
-### Windows — Background agent
+This generates an executable at `~/.homevault/bin/homevault`. To use `homevault` from any terminal session, add it to your shell configuration (`~/.zshrc`):
 
-```powershell
-# Manual start
-cd apps\windows-agent && .\.venv\Scripts\Activate.ps1
-python -m homevault_agent.service
+```bash
+echo 'export PATH="$HOME/.homevault/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
 
-# Auto-start at login (Task Scheduler) — see scripts/install_windows_task.ps1
+Verify it works:
+```bash
+homevault --help
+```
+
+### 6.2 Set up macOS background worker (launchd)
+
+Install the launchd User Agent to start the HomeVault worker automatically at login:
+
+```bash
+./scripts/install_mac_launchd.sh
+```
+
+To verify the agent is active:
+```bash
+launchctl list | grep homevault
+tail -f ~/.homevault/logs/worker.log
+```
+
+To stop and remove the agent at any time:
+```bash
+./scripts/uninstall_mac_launchd.sh
 ```
 
 ---
 
-## Step 7: Install Finder Quick Action (macOS)
+## Step 7: Configure Windows Agent (Receiver)
 
-See [integrations/macos/README.md](../integrations/macos/README.md) for Finder integration setup.
+### 7.1 Manual test run
+
+```powershell
+cd apps\windows-agent
+.\.venv\Scripts\Activate.ps1
+python -m homevault_agent.service --once
+```
+
+### 7.2 Install Task Scheduler background task
+
+To run continuously at Windows logon:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_task.ps1
+```
+
+See [docs/windows_setup.md](windows_setup.md) for full Windows operational details.
+
+---
+
+## Step 8: Install Finder Quick Action (Apple Shortcuts)
+
+HomeVault integrates seamlessly with macOS Finder via an Apple Shortcuts Quick Action:
+
+1. Open **Shortcuts** (`/System/Applications/Shortcuts.app`).
+2. Click **+** (New Shortcut) and name it **`Send to HomeVault`**.
+3. In the Inspector pane `(i)` on the right:
+   - Check **Use as Quick Action**.
+   - Ensure **Services Menu** → **Finder** is checked.
+   - Set **Shortcut Receives**: `Files` from `Quick Actions`.
+4. Add action: **Choose from Menu**:
+   - Prompt: `Choose transfer mode:`
+   - Menu items: `Copy to Windows`, `Move to Windows`.
+5. Under `Copy to Windows`, add **Run Shell Script**:
+   - Shell: `/bin/bash`
+   - Pass Input: **as arguments**
+   - Command: `~/.homevault/bin/homevault send --mode copy "$@"`
+6. Under `Move to Windows`, add **Run Shell Script**:
+   - Shell: `/bin/bash`
+   - Pass Input: **as arguments**
+   - Command: `~/.homevault/bin/homevault send --mode move "$@"`
+7. At the bottom of the shortcut, add **Show Notification**:
+   - Title: `HomeVault`
+   - Message: `Files queued for delivery to Windows PC.`
+8. Test by right-clicking any test file in Finder → **Quick Actions** → **Send to HomeVault**.
+
+See [integrations/macos/README.md](../integrations/macos/README.md) for screenshots and troubleshooting.
 
 ---
 
@@ -237,8 +301,11 @@ See [integrations/macos/README.md](../integrations/macos/README.md) for Finder i
 - [ ] Back up encryption key in password manager
 - [ ] Install Python 3.12+ on both machines
 - [ ] Clone repo and install dependencies on both machines
-- [ ] Authorize OAuth on macOS
-- [ ] Authorize OAuth on Windows
+- [ ] Authorize OAuth on macOS (`python -m homevault_sender.oauth`)
+- [ ] Authorize OAuth on Windows (`python -m homevault_agent.oauth`)
 - [ ] Create Windows Inbox directory
-- [ ] Install Finder Quick Action on macOS
-- [ ] Set up auto-start on both machines
+- [ ] Run `scripts/setup_mac_cli.sh` and add `~/.homevault/bin` to PATH
+- [ ] Install macOS launchd agent (`scripts/install_mac_launchd.sh`)
+- [ ] Install Windows Task Scheduler task (`scripts/install_windows_task.ps1`)
+- [ ] Create and enable Finder Quick Action in Apple Shortcuts
+

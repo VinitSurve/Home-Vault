@@ -139,11 +139,23 @@ Hashing is performed in streaming 8 KB chunks to avoid loading large files into 
 
 ### Move safety
 
-For Move operations, additional safety checks:
+For Move operations, strict non-destructive safety checks guarantee that the original file is never deleted prematurely or incorrectly:
 
-1. Before deleting the original, the sender re-computes `sha256(original_file)`.
-2. Compares it to the hash recorded when the transfer was created.
-3. If the file has changed since the transfer was created, the original is **not deleted** and the job is flagged `needs_attention`.
+1. **Receipt verification**: The sender validates the `CompletionReceipt` against the local transfer metadata:
+   - `transfer_id` must match.
+   - `sha256_hash` must match the original plaintext hash.
+   - `file_size` must match the original byte size.
+2. **Source existence check**: Verifies the source file still exists at the expected path.
+3. **Pre-deletion re-hashing**: Before deleting the original, the sender recomputes `sha256(original_file)` from disk in real time.
+4. **Tamper / modification protection**: If the file was edited, modified, or replaced between submission and Windows completion, the original is **retained**, the transfer transitions to `NEEDS_ATTENTION`, and a macOS alert is issued.
+5. **Atomic deletion**: The original local file is only deleted (`os.unlink`) after all validations pass, followed by purging the staged encrypted payload from Google Drive.
+
+## CLI and Shell Security
+
+- **No secrets in command line**: Neither the encryption key nor OAuth credentials are ever passed via command-line arguments or environment flags in daily use.
+- **Shell history protection**: Because the CLI only accepts file paths and mode flags (`homevault send --mode copy <path>`), no secrets are ever exposed to `.zsh_history`, `ps`, or process monitors.
+- **Keychain integration**: The background worker securely retrieves credentials directly from macOS Keychain via `keyring` / `security`.
+- **Log sanitization**: Worker logs (`~/.homevault/logs/worker.log`) only record transfer UUIDs, filenames, byte sizes, and operational statuses; never ciphertext, keys, or bearer tokens.
 
 ## Filename safety
 

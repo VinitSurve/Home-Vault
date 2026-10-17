@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vinit.homevault.sender</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_PATH__</string>
+        <string>-m</string>
+        <string>homevault_sender.cli</string>
+        <string>worker</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>__REPO_DIR__/packages/protocol/src:__REPO_DIR__/apps/mac-sender/src</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.homevault/logs/worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.homevault/logs/worker_err.log</string>
+</dict>
+</plist>
