@@ -272,7 +272,7 @@ class MacReceiver:
             # 4. Resumable download from Drive
             self.drive_client.download_file_resumable(
                 file_id=remote_blob["id"],
-                local_path=enc_path,
+                dest_path=enc_path,
                 progress_callback=progress_callback,
             )
 
