@@ -371,3 +371,285 @@ class TestCloudDiscoveryManager:
         # Receipt uploaded to Drive and cloud blob purged
         drive_client.upload_json_data.assert_called_once()
         drive_client.delete_file.assert_called_once_with("staged-id")
+
+    def test_dry_run_does_not_mutate_persistent_db(self, tmp_path, folder_map, db):
+        """Dry-run must not mutate persistent SQLite database or leave jobs in VERIFYING."""
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        plaintext = tmp_path / "doc.txt"
+        plaintext.write_bytes(b"Dry run persistence test")
+        expected_hash = hash_file(plaintext)
+        key = generate_key()
+
+        encrypted = tmp_path / "doc.enc"
+        encrypt_file(plaintext, encrypted, key)
+
+        metadata = TransferMetadata(
+            transfer_id="transfer-dry-persist",
+            mode="copy",
+            filename="doc.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(encrypted.read_bytes())
+        )
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+        )
+
+        # 1. Run dry-run
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key, dry_run=True)
+        assert final_path is None
+        assert receipt is None
+
+        # Verify persistent DB was NOT mutated or polluted with VERIFYING state
+        assert db.get("transfer-dry-persist") is None
+
+        # 2. Subsequent real run must succeed cleanly without 'verifying' -> 'downloading' error
+        drive_client.upload_json_data.return_value = "receipt-id"
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key, dry_run=False)
+        assert final_path is not None
+        assert final_path.exists()
+        assert receipt is not None
+
+        job = db.get("transfer-dry-persist")
+        assert job is not None
+        assert job.state == TransferState.COMPLETED
+
+    def test_regression_verifying_to_downloading_transition_recovery(self, tmp_path, folder_map, db):
+        """If a job was left in VERIFYING and staged file was unlinked, recovery must safely re-download."""
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        plaintext = tmp_path / "file.txt"
+        plaintext.write_bytes(b"Verifying recovery payload")
+        expected_hash = hash_file(plaintext)
+        key = generate_key()
+
+        encrypted = tmp_path / "file.enc"
+        encrypt_file(plaintext, encrypted, key)
+
+        transfer_id = "e8b17149-6eb2-4a06-90bb-f9ac135c6e8f"
+        metadata = TransferMetadata(
+            transfer_id=transfer_id,
+            mode="copy",
+            filename="file.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        # Pre-seed the database in VERIFYING state with no file on disk (the exact bug state)
+        job = TransferJob(
+            transfer_id=transfer_id,
+            mode=TransferMode.COPY,
+            state=TransferState.VERIFYING,
+            filename="file.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            retry_count=0,
+        )
+        db.insert(job)
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(encrypted.read_bytes())
+        )
+        drive_client.upload_json_data.return_value = "receipt-id"
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+        )
+
+        # Must execute without InvalidTransitionError
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key, dry_run=False)
+        assert final_path is not None
+        assert final_path.exists()
+        assert final_path.read_bytes() == b"Verifying recovery payload"
+
+        updated = db.get(transfer_id)
+        assert updated.state == TransferState.COMPLETED
+
+    def test_recovery_from_verifying_with_intact_staged_payload(self, tmp_path, folder_map, db):
+        """If a job was in VERIFYING and staged file is still intact on disk, resume without re-downloading."""
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        plaintext = tmp_path / "resumed.txt"
+        plaintext.write_bytes(b"Already downloaded payload")
+        expected_hash = hash_file(plaintext)
+        key = generate_key()
+
+        transfer_id = "transfer-resume-verifying"
+        metadata = TransferMetadata(
+            transfer_id=transfer_id,
+            mode="copy",
+            filename="resumed.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        manager = CloudDiscoveryManager(
+            drive_client=MagicMock(spec=DriveClient),
+            inbox_dir=inbox,
+            database=db,
+        )
+
+        # Place the encrypted file in temp_dir as if already downloaded
+        staged_enc = manager.temp_dir / f"{transfer_id}.enc"
+        encrypt_file(plaintext, staged_enc, key)
+
+        # Pre-seed job in VERIFYING state
+        job = TransferJob(
+            transfer_id=transfer_id,
+            mode=TransferMode.COPY,
+            state=TransferState.VERIFYING,
+            filename="resumed.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+        )
+        db.insert(job)
+
+        drive_client = manager.drive_client
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.upload_json_data.return_value = "receipt-id"
+
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key, dry_run=False)
+        assert final_path is not None
+        assert final_path.exists()
+        assert final_path.read_bytes() == b"Already downloaded payload"
+
+        # download_file_resumable should NOT have been called because file was already staged
+        drive_client.download_file_resumable.assert_not_called()
+
+        updated = db.get(transfer_id)
+        assert updated.state == TransferState.COMPLETED
+
+    def test_recovery_from_downloading_interrupted_state(self, tmp_path, folder_map, db):
+        """If a job was left in DOWNLOADING due to interruption, resuming must not fail self-transition."""
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        plaintext = tmp_path / "dl_interrupted.txt"
+        plaintext.write_bytes(b"Interrupted download test")
+        expected_hash = hash_file(plaintext)
+        key = generate_key()
+
+        encrypted = tmp_path / "dl_interrupted.enc"
+        encrypt_file(plaintext, encrypted, key)
+
+        transfer_id = "transfer-resume-dl"
+        metadata = TransferMetadata(
+            transfer_id=transfer_id,
+            mode="copy",
+            filename="dl_interrupted.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        # Pre-seed job in DOWNLOADING state
+        job = TransferJob(
+            transfer_id=transfer_id,
+            mode=TransferMode.COPY,
+            state=TransferState.DOWNLOADING,
+            filename="dl_interrupted.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+        )
+        db.insert(job)
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(encrypted.read_bytes())
+        )
+        drive_client.upload_json_data.return_value = "receipt-id"
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+        )
+
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key, dry_run=False)
+        assert final_path is not None
+        assert final_path.exists()
+        assert final_path.read_bytes() == b"Interrupted download test"
+
+        updated = db.get(transfer_id)
+        assert updated.state == TransferState.COMPLETED
+
+    def test_retry_from_failed_state(self, tmp_path, folder_map, db):
+        """A previously FAILED job being retried must transition via QUEUED -> DOWNLOADING -> VERIFYING."""
+        inbox = tmp_path / "inbox"
+        inbox.mkdir()
+
+        plaintext = tmp_path / "retry.txt"
+        plaintext.write_bytes(b"Retry after previous failure")
+        expected_hash = hash_file(plaintext)
+        key = generate_key()
+
+        encrypted = tmp_path / "retry.enc"
+        encrypt_file(plaintext, encrypted, key)
+
+        transfer_id = "transfer-failed-retry"
+        metadata = TransferMetadata(
+            transfer_id=transfer_id,
+            mode="copy",
+            filename="retry.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        job = TransferJob(
+            transfer_id=transfer_id,
+            mode=TransferMode.COPY,
+            state=TransferState.FAILED,
+            filename="retry.txt",
+            file_size=plaintext.stat().st_size,
+            sha256_hash=expected_hash,
+            retry_count=1,
+            error_message="Previous network error",
+        )
+        db.insert(job)
+
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+        drive_client.find_file.return_value = {"id": "staged-id"}
+        drive_client.download_file_resumable.side_effect = (
+            lambda file_id, dest_path, **kw: dest_path.write_bytes(encrypted.read_bytes())
+        )
+        drive_client.upload_json_data.return_value = "receipt-id"
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=inbox,
+            database=db,
+        )
+
+        final_path, receipt = manager.download_and_verify(metadata, encryption_key=key, dry_run=False)
+        assert final_path is not None
+        assert final_path.exists()
+
+        updated = db.get(transfer_id)
+        assert updated.state == TransferState.COMPLETED
+

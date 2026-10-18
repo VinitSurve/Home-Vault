@@ -167,31 +167,67 @@ class CloudDiscoveryManager:
                 f"Staged file {staged_filename} not found on Google Drive in Staging/."
             )
 
-        # 2. Record or update persistent job in local SQLite database
-        job = self._init_or_update_local_job(metadata)
+        # 2. Record or update persistent job in local SQLite database (never mutate persistent DB in dry-run)
+        job = None if dry_run else self._init_or_update_local_job(metadata)
 
         enc_path = self.temp_dir / f"{metadata.transfer_id}.enc"
         dec_path = self.temp_dir / f"{metadata.transfer_id}.dec"
 
         try:
-            # 3. Transition to DOWNLOADING
+            # 3. Determine if download is required or if we can resume from VERIFYING
+            need_download = True
             if job:
-                TransferStateMachine.transition(job, TransferState.DOWNLOADING)
-                if self.database:
-                    self.database.update(job)
+                # If already COMPLETED and delivered, return immediately
+                if job.state == TransferState.COMPLETED and job.dest_path and Path(job.dest_path).exists():
+                    receipt = CompletionReceipt(
+                        transfer_id=metadata.transfer_id,
+                        final_path=str(job.dest_path),
+                        file_size=metadata.file_size,
+                        sha256_hash=metadata.sha256_hash,
+                        receiver_platform="windows",
+                    )
+                    return Path(job.dest_path), receipt
 
-            # 4. Download encrypted payload in chunks with retries
-            self.drive_client.download_file_resumable(
-                file_id=remote_staged["id"],
-                dest_path=enc_path,
-                progress_callback=progress_callback,
-            )
+                # If in FAILED, reset to QUEUED for retry
+                if job.state == TransferState.FAILED:
+                    TransferStateMachine.transition(job, TransferState.QUEUED)
+                    if self.database:
+                        self.database.update(job)
 
-            # 5. Transition to VERIFYING
-            if job:
-                TransferStateMachine.transition(job, TransferState.VERIFYING)
-                if self.database:
-                    self.database.update(job)
+                # If in VERIFYING, check if the staged encrypted file is already intact on disk
+                if job.state == TransferState.VERIFYING:
+                    if enc_path.exists() and enc_path.stat().st_size > 0:
+                        need_download = False
+                    else:
+                        # Staged file is missing; reset to QUEUED via legal transitions (VERIFYING -> FAILED -> QUEUED)
+                        retries = job.retry_count
+                        TransferStateMachine.transition(
+                            job,
+                            TransferState.FAILED,
+                            error_message="Previous verification interrupted; restarting download.",
+                        )
+                        TransferStateMachine.transition(job, TransferState.QUEUED)
+                        job.retry_count = retries
+                        if self.database:
+                            self.database.update(job)
+
+            # 4. Download encrypted payload in chunks with retries (if needed)
+            if need_download:
+                if job and job.state != TransferState.DOWNLOADING:
+                    TransferStateMachine.transition(job, TransferState.DOWNLOADING)
+                    if self.database:
+                        self.database.update(job)
+
+                self.drive_client.download_file_resumable(
+                    file_id=remote_staged["id"],
+                    dest_path=enc_path,
+                    progress_callback=progress_callback,
+                )
+
+                if job and job.state != TransferState.VERIFYING:
+                    TransferStateMachine.transition(job, TransferState.VERIFYING)
+                    if self.database:
+                        self.database.update(job)
 
             # 6. Authenticated decryption
             try:
@@ -213,7 +249,7 @@ class CloudDiscoveryManager:
                     f"expected {metadata.sha256_hash}, got {actual_hash}."
                 )
 
-            # In dry-run mode, stop here and report verification success
+            # In dry-run mode, stop here and report verification success without mutating DB or committing to Inbox
             if dry_run:
                 logger.info("[Dry Run] Verified transfer %s (%s)", metadata.transfer_id, metadata.filename)
                 return None, None
@@ -260,16 +296,34 @@ class CloudDiscoveryManager:
             logger.error("Error processing transfer %s: %s", metadata.transfer_id, err)
             if job:
                 job.retry_count += 1
-                new_state = (
-                    TransferState.FAILED
-                    if job.retry_count >= job.max_retries
-                    else TransferState.QUEUED
-                )
-                try:
-                    TransferStateMachine.transition(job, new_state, error_message=str(err))
-                except Exception:
-                    job.state = new_state
-                    job.error_message = str(err)
+                retries = job.retry_count
+                if retries >= job.max_retries:
+                    if job.state != TransferState.FAILED:
+                        try:
+                            TransferStateMachine.transition(job, TransferState.FAILED, error_message=str(err))
+                        except Exception:
+                            job.state = TransferState.FAILED
+                            job.error_message = str(err)
+                else:
+                    # Reset to QUEUED for retry via legal state machine transitions
+                    if job.state == TransferState.VERIFYING:
+                        # State machine requires VERIFYING -> FAILED -> QUEUED
+                        try:
+                            TransferStateMachine.transition(job, TransferState.FAILED, error_message=str(err))
+                            TransferStateMachine.transition(job, TransferState.QUEUED)
+                        except Exception:
+                            job.state = TransferState.QUEUED
+                            job.error_message = str(err)
+                    elif job.state == TransferState.DOWNLOADING:
+                        try:
+                            TransferStateMachine.transition(job, TransferState.QUEUED, error_message=str(err))
+                        except Exception:
+                            job.state = TransferState.QUEUED
+                            job.error_message = str(err)
+                    else:
+                        job.state = TransferState.QUEUED
+                        job.error_message = str(err)
+                    job.retry_count = retries
                 if self.database:
                     self.database.update(job)
             raise
