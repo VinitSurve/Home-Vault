@@ -11,10 +11,28 @@ TARGET_PLIST="${TARGET_DIR}/${PLIST_LABEL}.plist"
 echo "=== HomeVault macOS launchd Agent Installer ==="
 
 # 1. Resolve Python executable
-PYTHON_EXE="$(which python3)"
-if [[ -f "${REPO_DIR}/apps/mac-sender/.venv/bin/python3" ]]; then
+# Prefer the verified ARM virtual environment (.venv-arm) containing cryptography
+PYTHON_EXE=""
+if [[ -x "${REPO_DIR}/apps/mac-sender/.venv-arm/bin/python" ]]; then
+    PYTHON_EXE="${REPO_DIR}/apps/mac-sender/.venv-arm/bin/python"
+elif [[ -x "${REPO_DIR}/apps/mac-sender/.venv-arm/bin/python3" ]]; then
+    PYTHON_EXE="${REPO_DIR}/apps/mac-sender/.venv-arm/bin/python3"
+elif [[ -x "${REPO_DIR}/apps/mac-sender/.venv/bin/python" ]]; then
+    PYTHON_EXE="${REPO_DIR}/apps/mac-sender/.venv/bin/python"
+elif [[ -x "${REPO_DIR}/apps/mac-sender/.venv/bin/python3" ]]; then
     PYTHON_EXE="${REPO_DIR}/apps/mac-sender/.venv/bin/python3"
+elif [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/python" ]]; then
+    PYTHON_EXE="${VIRTUAL_ENV}/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_EXE="$(command -v python3)"
 fi
+
+if [[ -z "${PYTHON_EXE}" || ! -x "${PYTHON_EXE}" ]]; then
+    echo "Error: Python executable not found or not executable." >&2
+    echo "Expected virtual environment at '${REPO_DIR}/apps/mac-sender/.venv-arm/bin/python'" >&2
+    exit 1
+fi
+
 echo "Using Python executable: ${PYTHON_EXE}"
 
 # 2. Ensure log directory exists
