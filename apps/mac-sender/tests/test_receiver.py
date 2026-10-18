@@ -146,8 +146,8 @@ class TestMacReceiverExecution:
         drive_client.ensure_folders.return_value = folder_map
         drive_client.find_file.return_value = {"id": "staged-drive-id"}
 
-        def mock_download(file_id, local_path, **kwargs):
-            shutil.copy(enc_file, local_path)
+        def mock_download(file_id, dest_path, **kwargs):
+            shutil.copy(enc_file, dest_path)
 
         drive_client.download_file_resumable.side_effect = mock_download
         drive_client.upload_json_data.return_value = "receipt-drive-id"
@@ -221,7 +221,7 @@ class TestMacReceiverExecution:
         drive_client.ensure_folders.return_value = folder_map
         drive_client.find_file.return_value = {"id": "blob-dup"}
         drive_client.download_file_resumable.side_effect = (
-            lambda file_id, local_path, **kw: shutil.copy(enc_file, local_path)
+            lambda file_id, dest_path, **kw: shutil.copy(enc_file, dest_path)
         )
         drive_client.upload_json_data.return_value = "receipt-id"
 
@@ -266,7 +266,7 @@ class TestMacReceiverExecution:
         drive_client.ensure_folders.return_value = folder_map
         drive_client.find_file.return_value = {"id": "blob-trav"}
         drive_client.download_file_resumable.side_effect = (
-            lambda file_id, local_path, **kw: shutil.copy(enc, local_path)
+            lambda file_id, dest_path, **kw: shutil.copy(enc, dest_path)
         )
         drive_client.upload_json_data.return_value = "receipt-trav-id"
 
@@ -337,7 +337,7 @@ class TestMacReceiverExecution:
         drive_client.ensure_folders.return_value = folder_map
         drive_client.find_file.return_value = {"id": "blob-corrupt"}
         drive_client.download_file_resumable.side_effect = (
-            lambda file_id, local_path, **kw: shutil.copy(enc, local_path)
+            lambda file_id, dest_path, **kw: shutil.copy(enc, dest_path)
         )
 
         receiver = MacReceiver(
@@ -380,7 +380,7 @@ class TestMacReceiverExecution:
         drive_client.ensure_folders.return_value = folder_map
         drive_client.find_file.return_value = {"id": "blob-dry"}
         drive_client.download_file_resumable.side_effect = (
-            lambda file_id, local_path, **kw: shutil.copy(enc, local_path)
+            lambda file_id, dest_path, **kw: shutil.copy(enc, dest_path)
         )
 
         receiver = MacReceiver(
@@ -486,6 +486,7 @@ class TestMacReceiverExecution:
         final_path, receipt = receiver.download_and_verify(meta)
 
         assert final_path == delivered_file
+        assert receipt is not None
         assert receipt.receiver_platform == "macos"
         assert receipt.transfer_id == "transfer-partially-failed"
         drive_client.download_file_resumable.assert_not_called()

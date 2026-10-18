@@ -1,0 +1,30 @@
+{
+  "include": [
+    "packages/protocol",
+    "apps/mac-sender",
+    "apps/windows-agent"
+  ],
+  "extraPaths": [
+    "packages/protocol/src",
+    "apps/mac-sender/src",
+    "apps/windows-agent/src"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "apps/mac-sender",
+      "extraPaths": [
+        "../../packages/protocol/src",
+        "src"
+      ]
+    },
+    {
+      "root": "apps/windows-agent",
+      "extraPaths": [
+        "../../packages/protocol/src",
+        "src"
+      ]
+    }
+  ],
+  "venvPath": "apps/mac-sender",
+  "venv": ".venv-arm"
+}

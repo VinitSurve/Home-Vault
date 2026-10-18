@@ -1,0 +1,12 @@
+{
+  "include": [
+    "src",
+    "tests"
+  ],
+  "extraPaths": [
+    "../../packages/protocol/src",
+    "src"
+  ],
+  "venvPath": ".",
+  "venv": ".venv-arm"
+}
