@@ -41,11 +41,15 @@ class TransferConfig:
 
 @dataclass
 class SenderConfig:
-    """macOS sender settings."""
+    """macOS sender and receiver settings."""
 
     db_path: str = str(_DEFAULT_CONFIG_DIR / "sender.db")
+    receiver_db_path: str = str(_DEFAULT_CONFIG_DIR / "receiver.db")
+    inbox_path: str = str(Path.home() / "HomeVault" / "Inbox")
     drive: DriveConfig = field(default_factory=DriveConfig)
     transfer: TransferConfig = field(default_factory=TransferConfig)
+
+
 
 
 @dataclass
@@ -135,6 +139,14 @@ def get_sender_config(path: Optional[str | Path] = None) -> SenderConfig:
 
     return SenderConfig(
         db_path=send_dict.get("db_path", str(_DEFAULT_CONFIG_DIR / "sender.db")),
+        receiver_db_path=send_dict.get(
+            "receiver_db_path", str(_DEFAULT_CONFIG_DIR / "receiver.db")
+        ),
+        inbox_path=send_dict.get(
+            "inbox_path", str(Path.home() / "HomeVault" / "Inbox")
+        ),
         drive=drive,
         transfer=transfer,
     )
+
+

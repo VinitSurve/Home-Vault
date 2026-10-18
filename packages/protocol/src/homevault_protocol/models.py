@@ -42,6 +42,42 @@ class TransferState(str, Enum):
     NEEDS_ATTENTION = "needs_attention"
 
 
+class Platform(str, Enum):
+    """Supported operating system platforms for transfer routing."""
+
+    MACOS = "macos"
+    WINDOWS = "windows"
+
+
+def validate_platform(val: str | Platform, field_name: str = "platform") -> Platform:
+    """Validate and normalize a platform string or Platform enum member.
+
+    Args:
+        val: A Platform enum or string ('macos', 'windows', case-insensitive).
+        field_name: Field name used in error messages.
+
+    Returns:
+        The validated Platform enum member.
+
+    Raises:
+        ValueError: If val is None, empty, or not a supported platform.
+    """
+    if isinstance(val, Platform):
+        return val
+    if not isinstance(val, str) or not val.strip():
+        raise ValueError(
+            f"Invalid {field_name}: must be a non-empty string or Platform enum, got {val!r}"
+        )
+    cleaned = val.strip().lower()
+    try:
+        return Platform(cleaned)
+    except ValueError:
+        valid_options = ", ".join(repr(p.value) for p in Platform)
+        raise ValueError(
+            f"Invalid {field_name} {val!r}. Supported platforms are: {valid_options}"
+        )
+
+
 @dataclass
 class TransferJob:
     """A single file-transfer job.
@@ -53,7 +89,7 @@ class TransferJob:
         transfer_id:        UUID v4 unique identifier.
         mode:               Copy or Move.
         state:              Current lifecycle state.
-        source_path:        Original file path on the Mac (sender-only).
+        source_path:        Original file path on the sender.
         filename:           Original filename (basename only, no directory).
         file_size:          Size of the original file in bytes.
         sha256_hash:        SHA-256 hex digest of the original plaintext file.
@@ -67,6 +103,8 @@ class TransferJob:
         max_retries:        Maximum retries before marking failed.
         error_message:      Human-readable error description, if any.
         upload_session_uri: Resumable upload URI for interrupted uploads.
+        sender_platform:    Originating platform (Platform.MACOS or Platform.WINDOWS).
+        target_platform:    Destination platform (Platform.MACOS or Platform.WINDOWS).
     """
 
     transfer_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -90,6 +128,33 @@ class TransferJob:
     max_retries: int = 5
     error_message: Optional[str] = None
     upload_session_uri: Optional[str] = None
+    sender_platform: Platform = Platform.MACOS
+    target_platform: Optional[Platform] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.mode, str):
+            self.mode = TransferMode(self.mode)
+        if isinstance(self.state, str):
+            self.state = TransferState(self.state)
+        # Validate sender_platform (rejects None, invalid types, unsupported strings)
+        self.sender_platform = validate_platform(
+            self.sender_platform, "sender_platform"
+        )
+
+        if self.target_platform is None:
+            if self.sender_platform == Platform.MACOS:
+                self.target_platform = Platform.WINDOWS
+            else:
+                self.target_platform = Platform.MACOS
+        else:
+            self.target_platform = validate_platform(
+                self.target_platform, "target_platform"
+            )
+
+        if self.sender_platform == self.target_platform:
+            raise ValueError(
+                f"Sender platform and target platform cannot be the same: {self.sender_platform.value!r}"
+            )
 
     def touch(self) -> None:
         """Update the `updated_at` timestamp to now (UTC)."""
@@ -115,11 +180,22 @@ class TransferJob:
             "max_retries": self.max_retries,
             "error_message": self.error_message,
             "upload_session_uri": self.upload_session_uri,
+            "sender_platform": self.sender_platform.value,
+            "target_platform": self.target_platform.value if self.target_platform else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> TransferJob:
         """Deserialize from a plain dict."""
+        sender_raw = data.get("sender_platform", Platform.MACOS.value)
+        sender = validate_platform(sender_raw, "sender_platform")
+
+        target_raw = data.get("target_platform")
+        if target_raw is not None:
+            target = validate_platform(target_raw, "target_platform")
+        else:
+            target = Platform.WINDOWS if sender == Platform.MACOS else Platform.MACOS
+
         return cls(
             transfer_id=data["transfer_id"],
             mode=TransferMode(data["mode"]),
@@ -138,4 +214,6 @@ class TransferJob:
             max_retries=data.get("max_retries", 5),
             error_message=data.get("error_message"),
             upload_session_uri=data.get("upload_session_uri"),
+            sender_platform=sender,
+            target_platform=target,
         )

@@ -11,6 +11,9 @@ dependencies = [
     "homevault-protocol",
 ]
 
+[project.scripts]
+homevault = "homevault_agent.cli:cli_entrypoint"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",

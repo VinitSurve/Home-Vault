@@ -12,10 +12,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator, Optional
 
-from homevault_protocol.models import TransferJob, TransferMode, TransferState
+from homevault_protocol.models import (
+    Platform,
+    TransferJob,
+    TransferMode,
+    TransferState,
+)
 
 # Schema version — increment when adding migrations.
-_CURRENT_VERSION = 1
+_CURRENT_VERSION = 2
 
 _MIGRATIONS: dict[int, str] = {
     1: """
@@ -50,6 +55,13 @@ _MIGRATIONS: dict[int, str] = {
     );
 
     INSERT OR REPLACE INTO schema_version (version) VALUES (1);
+    """,
+    2: """
+    ALTER TABLE transfers ADD COLUMN sender_platform TEXT NOT NULL DEFAULT 'macos';
+    ALTER TABLE transfers ADD COLUMN target_platform TEXT NOT NULL DEFAULT 'windows';
+    CREATE INDEX IF NOT EXISTS idx_transfers_target ON transfers(target_platform);
+    CREATE INDEX IF NOT EXISTS idx_transfers_sender ON transfers(sender_platform);
+    INSERT OR REPLACE INTO schema_version (version) VALUES (2);
     """,
 }
 
@@ -114,8 +126,35 @@ class TransferDatabase:
             return
 
         for version in range(current + 1, _CURRENT_VERSION + 1):
-            if version in _MIGRATIONS:
-                self.conn.executescript(_MIGRATIONS[version])
+            if version == 1:
+                self.conn.executescript(_MIGRATIONS[1])
+            elif version == 2:
+                self._apply_migration_v2()
+
+    def _apply_migration_v2(self) -> None:
+        """Apply migration v2 idempotently: add sender_platform and target_platform."""
+        existing_cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(transfers)").fetchall()
+        }
+        with self.transaction():
+            if "sender_platform" not in existing_cols:
+                self.conn.execute(
+                    "ALTER TABLE transfers ADD COLUMN sender_platform TEXT NOT NULL DEFAULT 'macos'"
+                )
+            if "target_platform" not in existing_cols:
+                self.conn.execute(
+                    "ALTER TABLE transfers ADD COLUMN target_platform TEXT NOT NULL DEFAULT 'windows'"
+                )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transfers_target ON transfers(target_platform)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_transfers_sender ON transfers(sender_platform)"
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO schema_version (version) VALUES (2)"
+            )
 
     def _get_version(self) -> int:
         """Return the current schema version, or 0 if uninitialized."""
@@ -184,6 +223,58 @@ class TransferDatabase:
             f"ORDER BY created_at ASC",
             actionable_states,
         ).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def get_by_target(
+        self,
+        target_platform: Platform | str,
+        state: Optional[TransferState] = None,
+    ) -> list[TransferJob]:
+        """Return jobs destined for a target platform, optionally filtered by state."""
+        target = (
+            target_platform.value
+            if isinstance(target_platform, Platform)
+            else str(target_platform)
+        )
+        if state is not None:
+            state_val = state.value if hasattr(state, "value") else str(state)
+            rows = self.conn.execute(
+                "SELECT * FROM transfers WHERE target_platform = ? AND state = ? "
+                "ORDER BY created_at ASC",
+                (target, state_val),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM transfers WHERE target_platform = ? "
+                "ORDER BY created_at ASC",
+                (target,),
+            ).fetchall()
+        return [self._row_to_job(r) for r in rows]
+
+    def get_by_sender(
+        self,
+        sender_platform: Platform | str,
+        state: Optional[TransferState] = None,
+    ) -> list[TransferJob]:
+        """Return jobs initiated by a sender platform, optionally filtered by state."""
+        sender = (
+            sender_platform.value
+            if isinstance(sender_platform, Platform)
+            else str(sender_platform)
+        )
+        if state is not None:
+            state_val = state.value if hasattr(state, "value") else str(state)
+            rows = self.conn.execute(
+                "SELECT * FROM transfers WHERE sender_platform = ? AND state = ? "
+                "ORDER BY created_at ASC",
+                (sender, state_val),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM transfers WHERE sender_platform = ? "
+                "ORDER BY created_at ASC",
+                (sender,),
+            ).fetchall()
         return [self._row_to_job(r) for r in rows]
 
     def get_all(self) -> list[TransferJob]:

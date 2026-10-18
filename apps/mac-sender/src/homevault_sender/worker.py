@@ -24,13 +24,14 @@ from homevault_protocol.models import TransferJob, TransferMode, TransferState
 from homevault_protocol.state_machine import TransferStateMachine
 from homevault_sender.notifications import send_notification
 from homevault_sender.queue import SenderQueue
+from homevault_sender.receiver import MacReceiver
 from homevault_sender.staging import StagingManager
 
 logger = logging.getLogger("homevault.sender")
 
 
 class SenderWorker:
-    """Background worker daemon for macOS file uploads and Move finalization."""
+    """Background worker daemon for macOS file uploads, receipt finalization, and incoming transfers."""
 
     def __init__(
         self,
@@ -40,6 +41,9 @@ class SenderWorker:
         queue: Optional[SenderQueue] = None,
         staging_manager: Optional[StagingManager] = None,
         encryption_key: Optional[str] = None,
+        receiver: Optional[MacReceiver] = None,
+        receiver_db: Optional[TransferDatabase] = None,
+        enable_receiver: bool = True,
     ) -> None:
         self.config = config
         self.drive_client = drive_client
@@ -53,6 +57,26 @@ class SenderWorker:
         self._explicit_key = encryption_key
         self._running = False
         self._is_looping = False
+
+        if receiver:
+            self.receiver = receiver
+        elif enable_receiver:
+            rec_db_path = Path(
+                getattr(self.config, "receiver_db_path", None)
+                or (Path(self.config.db_path).parent / "receiver.db")
+            ).expanduser()
+            rec_db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._receiver_db = receiver_db or TransferDatabase(rec_db_path)
+            self.receiver = MacReceiver(
+                drive_client=self.drive_client,
+                inbox_dir=getattr(self.config, "inbox_path", None),
+                database=self._receiver_db,
+                config=self.config,
+                encryption_key=self._explicit_key,
+            )
+        else:
+            self.receiver = None
+
 
     def get_encryption_key(self) -> str:
         """Retrieve the shared encryption key from macOS Keychain or environment."""
@@ -187,12 +211,24 @@ class SenderWorker:
 
         return receipted_count
 
+    def poll_inbound_transfers(self) -> int:
+        """Poll and download pending inbound transfers targeted at macOS."""
+        if not self.receiver:
+            return 0
+        try:
+            delivered = self.receiver.poll_and_process()
+            return len(delivered)
+        except Exception as err:
+            logger.error("Inbound receiver polling error: %s", err)
+            return 0
+
     def run_once(self) -> dict[str, int]:
-        """Execute a single polling iteration for uploads and receipts."""
+        """Execute a single polling iteration for uploads, receipts, and inbound transfers."""
         self._is_looping = False
         uploaded = self.process_pending_uploads()
         receipted = self.check_completion_receipts()
-        return {"uploaded": uploaded, "receipted": receipted}
+        received = self.poll_inbound_transfers()
+        return {"uploaded": uploaded, "receipted": receipted, "received": received}
 
     def run_forever(self) -> None:
         """Run continuous background queue worker with signal handling."""
@@ -202,7 +238,7 @@ class SenderWorker:
 
         poll_interval = max(5, int(self.config.transfer.poll_interval_seconds))
         logger.info(
-            "Starting HomeVault macOS Sender Worker (Poll interval: %ds)",
+            "Starting HomeVault macOS Unified Worker (Poll interval: %ds)",
             poll_interval,
         )
 
@@ -210,9 +246,18 @@ class SenderWorker:
             while self._running:
                 try:
                     self.process_pending_uploads()
+                except Exception as err:
+                    logger.error("Outbound upload iteration error: %s", err)
+
+                try:
                     self.check_completion_receipts()
                 except Exception as err:
-                    logger.error("Unexpected worker iteration error: %s", err)
+                    logger.error("Receipt check iteration error: %s", err)
+
+                try:
+                    self.poll_inbound_transfers()
+                except Exception as err:
+                    logger.error("Inbound receive iteration error: %s", err)
 
                 for _ in range(poll_interval):
                     if not self._running:
@@ -220,7 +265,8 @@ class SenderWorker:
                     time.sleep(1)
 
         finally:
-            logger.info("HomeVault macOS Sender Worker stopped cleanly.")
+            logger.info("HomeVault macOS Worker stopped cleanly.")
+
 
     def stop(self) -> None:
         """Signal the worker to stop gracefully."""

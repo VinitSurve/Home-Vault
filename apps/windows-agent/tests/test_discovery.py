@@ -653,3 +653,74 @@ class TestCloudDiscoveryManager:
         updated = db.get(transfer_id)
         assert updated.state == TransferState.COMPLETED
 
+    def test_discover_pending_transfers_filters_by_platform_routing(
+        self, tmp_path, folder_map
+    ):
+        drive_client = MagicMock(spec=DriveClient)
+        drive_client.ensure_folders.return_value = folder_map
+
+        # Metadata records on Drive:
+        # - job-win: explicit target_platform='windows' -> SHOULD be discovered by Windows receiver
+        # - job-legacy: no target_platform -> SHOULD be discovered (legacy Mac->Windows default)
+        # - job-mac: explicit target_platform='macos' -> MUST BE IGNORED by Windows receiver
+        drive_client.list_files_in_folder.side_effect = [
+            [],  # No receipts on Drive
+            [
+                {"id": "m1", "name": "job-win.json"},
+                {"id": "m2", "name": "job-legacy.json"},
+                {"id": "m3", "name": "job-mac.json"},
+            ],  # Metadata folder
+        ]
+
+        def mock_read_json(file_id):
+            if file_id == "m1":
+                return {
+                    "transfer_id": "job-win",
+                    "mode": "copy",
+                    "filename": "file_win.txt",
+                    "file_size": 100,
+                    "sha256_hash": "a" * 64,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "sender_platform": "macos",
+                    "target_platform": "windows",
+                }
+            elif file_id == "m2":
+                return {
+                    "transfer_id": "job-legacy",
+                    "mode": "copy",
+                    "filename": "file_legacy.txt",
+                    "file_size": 100,
+                    "sha256_hash": "b" * 64,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            elif file_id == "m3":
+                return {
+                    "transfer_id": "job-mac",
+                    "mode": "copy",
+                    "filename": "file_mac.txt",
+                    "file_size": 100,
+                    "sha256_hash": "c" * 64,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "sender_platform": "windows",
+                    "target_platform": "macos",
+                }
+            return {}
+
+        drive_client.read_json_file.side_effect = mock_read_json
+
+        manager = CloudDiscoveryManager(
+            drive_client=drive_client,
+            inbox_dir=tmp_path / "Inbox",
+            receiver_platform="windows",
+        )
+
+        pending = manager.discover_pending_transfers()
+        pending_ids = [m.transfer_id for m in pending]
+
+        # Windows receiver MUST discover job-win and job-legacy, and MUST ignore job-mac
+        assert "job-win" in pending_ids
+        assert "job-legacy" in pending_ids
+        assert "job-mac" not in pending_ids
+        assert len(pending) == 2
+
+

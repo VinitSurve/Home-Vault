@@ -27,7 +27,7 @@ from homevault_protocol.drive.client import DriveClient
 from homevault_protocol.filenames import resolve_destination
 from homevault_protocol.hashing import hash_file
 from homevault_protocol.metadata import CompletionReceipt, TransferMetadata
-from homevault_protocol.models import TransferJob, TransferMode, TransferState
+from homevault_protocol.models import Platform, TransferJob, TransferMode, TransferState
 from homevault_protocol.state_machine import TransferStateMachine
 
 logger = logging.getLogger(__name__)
@@ -54,12 +54,19 @@ class CloudDiscoveryManager:
         database: Optional[TransferDatabase] = None,
         temp_dir: Optional[str | Path] = None,
         cleanup_cloud_after_receipt: bool = True,
+        receiver_platform: str | Platform = Platform.WINDOWS,
     ) -> None:
         self.drive_client = drive_client
         self.inbox_dir = Path(inbox_dir).resolve()
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
         self.database = database
         self.cleanup_cloud_after_receipt = cleanup_cloud_after_receipt
+        self.receiver_platform = (
+            receiver_platform.value
+            if isinstance(receiver_platform, Platform)
+            else str(receiver_platform).strip().lower()
+        )
+
 
         # Place staging on the same filesystem as inbox_dir to ensure atomic os.replace
         if temp_dir:
@@ -125,7 +132,20 @@ class CloudDiscoveryManager:
 
             try:
                 raw_data = self.drive_client.read_json_file(meta_file["id"])
-                meta = TransferMetadata(**raw_data)
+                meta = TransferMetadata.from_dict(raw_data)
+
+                # Enforce receiver routing:
+                # If target_platform is None or empty, it is a legacy transfer, which defaults to 'windows'.
+                target = (meta.target_platform or Platform.WINDOWS.value).strip().lower()
+                if target != self.receiver_platform:
+                    logger.debug(
+                        "Skipping transfer %s: target_platform %r does not match receiver %r",
+                        meta.transfer_id,
+                        target,
+                        self.receiver_platform,
+                    )
+                    continue
+
                 pending.append(meta)
             except Exception as err:
                 logger.error("Failed to parse metadata file %s: %s", meta_file["name"], err)
@@ -178,15 +198,20 @@ class CloudDiscoveryManager:
             need_download = True
             if job:
                 # If already COMPLETED and delivered, return immediately
-                if job.state == TransferState.COMPLETED and job.dest_path and Path(job.dest_path).exists():
-                    receipt = CompletionReceipt(
-                        transfer_id=metadata.transfer_id,
-                        final_path=str(job.dest_path),
-                        file_size=metadata.file_size,
-                        sha256_hash=metadata.sha256_hash,
-                        receiver_platform="windows",
-                    )
-                    return Path(job.dest_path), receipt
+                if job.dest_path and Path(job.dest_path).exists():
+                    dest_p = Path(job.dest_path)
+                    if job.state == TransferState.COMPLETED or (
+                        dest_p.stat().st_size == metadata.file_size
+                        and hash_file(dest_p).lower() == metadata.sha256_hash.lower()
+                    ):
+                        receipt = CompletionReceipt(
+                            transfer_id=metadata.transfer_id,
+                            final_path=str(job.dest_path),
+                            file_size=metadata.file_size,
+                            sha256_hash=metadata.sha256_hash,
+                            receiver_platform=self.receiver_platform,
+                        )
+                        return Path(job.dest_path), receipt
 
                 # If in FAILED, reset to QUEUED for retry
                 if job.state == TransferState.FAILED:
@@ -259,6 +284,10 @@ class CloudDiscoveryManager:
 
             # 9. Atomic commit to final Inbox path
             self._commit_to_inbox(dec_path, final_path)
+            if job:
+                job.dest_path = str(final_path)
+                if self.database:
+                    self.database.update(job)
 
             # 10. Issue completion receipt and upload to Drive
             receipt = CompletionReceipt(
@@ -266,7 +295,7 @@ class CloudDiscoveryManager:
                 final_path=str(final_path),
                 file_size=metadata.file_size,
                 sha256_hash=metadata.sha256_hash,
-                receiver_platform="windows",
+                receiver_platform=self.receiver_platform,
             )
             receipt_filename = f"{metadata.transfer_id}.json"
             receipt_id = self.drive_client.upload_json_data(
@@ -354,6 +383,8 @@ class CloudDiscoveryManager:
 
         job = self.database.get(metadata.transfer_id)
         if job is None:
+            sender = metadata.sender_platform or Platform.MACOS.value
+            target = metadata.target_platform or Platform.WINDOWS.value
             job = TransferJob(
                 transfer_id=metadata.transfer_id,
                 mode=TransferMode(metadata.mode),
@@ -361,6 +392,8 @@ class CloudDiscoveryManager:
                 filename=metadata.filename,
                 file_size=metadata.file_size,
                 sha256_hash=metadata.sha256_hash,
+                sender_platform=sender,
+                target_platform=target,
             )
             self.database.insert(job)
         return job
@@ -373,15 +406,27 @@ class CloudDiscoveryManager:
             final_path=job.dest_path or "",
             file_size=job.file_size,
             sha256_hash=job.sha256_hash,
-            receiver_platform="windows",
+            receiver_platform=self.receiver_platform,
         )
-        self.drive_client.upload_json_data(
+        receipt_id = self.drive_client.upload_json_data(
             name=f"{job.transfer_id}.json",
             parent_id=folder_map.receipts_id,
             json_content=receipt.to_json(),
         )
+        if job.state != TransferState.COMPLETED:
+            try:
+                TransferStateMachine.transition(job, TransferState.COMPLETED)
+            except Exception:
+                job.state = TransferState.COMPLETED
+        if receipt_id is not None:
+            job.drive_receipt_id = str(receipt_id)
+        if self.database:
+            self.database.update(job)
         if self.cleanup_cloud_after_receipt:
-            self.cleanup_staged_blob(job.transfer_id)
+            try:
+                self.cleanup_staged_blob(job.transfer_id)
+            except Exception as e:
+                logger.warning("Could not delete cloud staged blob %s: %s", job.transfer_id, e)
 
     def cleanup_staged_blob(self, transfer_id: str) -> bool:
         """Purge the staged encrypted blob from Google Drive after delivery."""

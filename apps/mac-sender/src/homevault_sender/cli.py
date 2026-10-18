@@ -130,7 +130,10 @@ def cmd_worker(args: argparse.Namespace, config, database: TransferDatabase) -> 
     if args.once:
         print("Running single worker iteration...")
         res = worker.run_once()
-        print(f"Cycle completed: {res['uploaded']} uploaded, {res['receipted']} receipted.")
+        print(
+            f"Cycle completed: {res['uploaded']} uploaded, "
+            f"{res['receipted']} receipted, {res.get('received', 0)} received."
+        )
         return 0
     else:
         worker.run_forever()

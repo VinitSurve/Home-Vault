@@ -287,9 +287,78 @@ class TestSenderWorkerReceipts:
             drive_client=MagicMock(spec=DriveClient),
             database=db,
             queue=MagicMock(spec=SenderQueue, get_pending_uploads=lambda: [], get_queued_transfers=lambda: []),
+            enable_receiver=False,
         )
         res = worker.run_once()
-        assert res == {"uploaded": 0, "receipted": 0}
+        assert res == {"uploaded": 0, "receipted": 0, "received": 0}
+
+    def test_run_once_with_inbound_receiver(self, config, db):
+        receiver_mock = MagicMock()
+        receiver_mock.poll_and_process.return_value = [(Path("/path"), MagicMock())]
+
+        worker = SenderWorker(
+            config=config,
+            drive_client=MagicMock(spec=DriveClient),
+            database=db,
+            queue=MagicMock(spec=SenderQueue, get_pending_uploads=lambda: [], get_queued_transfers=lambda: []),
+            receiver=receiver_mock,
+        )
+        res = worker.run_once()
+        assert res["received"] == 1
+        receiver_mock.poll_and_process.assert_called_once()
+
+    def test_inbound_receiver_error_isolated(self, config, db):
+        receiver_mock = MagicMock()
+        receiver_mock.poll_and_process.side_effect = RuntimeError("Inbound network failure")
+
+        worker = SenderWorker(
+            config=config,
+            drive_client=MagicMock(spec=DriveClient),
+            database=db,
+            queue=MagicMock(spec=SenderQueue, get_pending_uploads=lambda: [], get_queued_transfers=lambda: []),
+            receiver=receiver_mock,
+        )
+        res = worker.run_once()
+        assert res["received"] == 0
+
+    def test_outbound_upload_error_isolated_from_inbound(self, config, db, tmp_path):
+        queue = SenderQueue(database=db)
+        f = tmp_path / "fail_upload.txt"
+        f.write_text("content")
+        queue.enqueue_file(f)
+
+        staging_mock = MagicMock()
+        staging_mock.stage_job.side_effect = RuntimeError("Outbound upload failure")
+
+        receiver_mock = MagicMock()
+        receiver_mock.poll_and_process.return_value = [(Path("/delivered"), MagicMock())]
+
+        worker = SenderWorker(
+            config=config,
+            drive_client=MagicMock(spec=DriveClient),
+            database=db,
+            queue=queue,
+            staging_manager=staging_mock,
+            receiver=receiver_mock,
+            encryption_key="test-key",
+        )
+        res = worker.run_once()
+        assert res["uploaded"] == 0
+        assert res["received"] == 1
+        receiver_mock.poll_and_process.assert_called_once()
+
+    def test_dedicated_receiver_database_created(self, config, db, tmp_path):
+        config.receiver_db_path = str(tmp_path / "custom_receiver.db")
+        worker = SenderWorker(
+            config=config,
+            drive_client=MagicMock(spec=DriveClient),
+            database=db,
+            enable_receiver=True,
+        )
+        assert worker.receiver is not None
+        assert worker.receiver.database.db_path == Path(tmp_path / "custom_receiver.db")
+        worker.receiver.database.close()
+
 
     def test_run_forever_graceful_stop(self, config, db):
         queue_mock = MagicMock(spec=SenderQueue)
