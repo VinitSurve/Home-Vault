@@ -82,7 +82,7 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Description "HomeVault Windows Receiver Agent — background cloud queue receiver" `
+    -Description "HomeVault Windows Receiver Agent - background cloud queue receiver" `
     -Force | Out-Null
 
 Write-Host "Task '$TaskName' successfully registered!" -ForegroundColor Green
