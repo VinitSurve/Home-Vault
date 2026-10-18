@@ -4,59 +4,78 @@
 param(
     [string]$TaskName = "HomeVault-Receiver",
     [string]$PythonExe = "",
-    [string]$InboxPath = "D:\HomeVault\Inbox"
+    [string]$RepoRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "=== HomeVault Windows Scheduled Task Installer ===" -ForegroundColor Cyan
 
-# 1. Resolve Python executable
+# 1. Resolve working directory (HomeVault repo root)
+if (-not $RepoRoot) {
+    $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+if (-not (Test-Path $RepoRoot)) {
+    Write-Error "Repository root not found at '$RepoRoot'."
+    exit 1
+}
+Write-Host "Repository root: $RepoRoot" -ForegroundColor Green
+
+# 2. Resolve Python executable
 if (-not $PythonExe) {
-    # Check if inside a virtual environment
-    $VenvPython = Join-Path $PSScriptRoot "..\apps\windows-agent\.venv\Scripts\python.exe"
-    if (Test-Path $VenvPython) {
-        $PythonExe = (Resolve-Path $VenvPython).Path
-    } else {
-        $PythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
+    # Check primary repository virtual environment first (.venv)
+    $CandidatePaths = @(
+        (Join-Path $RepoRoot ".venv\Scripts\python.exe"),
+        (Join-Path $RepoRoot "apps\windows-agent\.venv\Scripts\python.exe")
+    )
+    if ($env:VIRTUAL_ENV) {
+        $CandidatePaths = @((Join-Path $env:VIRTUAL_ENV "Scripts\python.exe")) + $CandidatePaths
+    }
+
+    foreach ($Candidate in $CandidatePaths) {
+        if (Test-Path $Candidate) {
+            $PythonExe = (Resolve-Path $Candidate).Path
+            break
+        }
+    }
+
+    if (-not $PythonExe) {
+        $Cmd = Get-Command python -ErrorAction SilentlyContinue
+        if ($Cmd) {
+            $PythonExe = $Cmd.Source
+        }
     }
 }
 
 if (-not $PythonExe -or -not (Test-Path $PythonExe)) {
-    Write-Error "Python executable not found. Please specify -PythonExe path or activate your virtual environment."
+    Write-Error "Python executable not found. Expected virtual environment at '$RepoRoot\.venv\Scripts\python.exe' or specify -PythonExe."
     exit 1
 }
 
 Write-Host "Using Python executable: $PythonExe" -ForegroundColor Green
 
-# 2. Resolve working directory (HomeVault repo root)
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-Write-Host "Repository root: $RepoRoot" -ForegroundColor Green
-
-# 3. Ensure Inbox directory exists
-if (-not (Test-Path $InboxPath)) {
-    Write-Host "Creating Inbox directory: $InboxPath" -ForegroundColor Yellow
-    New-Item -ItemType Directory -Force -Path $InboxPath | Out-Null
-}
-
-# 4. Define scheduled task action
-# Pass PYTHONPATH to ensure packages/protocol and apps/windows-agent are discoverable
-$Arguments = "-c `"import sys; sys.path.extend(['$RepoRoot/packages/protocol/src', '$RepoRoot/apps/windows-agent/src']); from homevault_agent.service import main; sys.exit(main())`""
+# 3. Define scheduled task action
+# Executes 'python.exe -m homevault_agent.service' from repository root.
+# Continuous polling loop starts automatically (worker.run_forever) without --once.
+# Configuration and Inbox path are read from ~/.homevault/config.toml.
+$Arguments = "-m homevault_agent.service"
 $Action = New-ScheduledTaskAction -Execute $PythonExe -Argument $Arguments -WorkingDirectory $RepoRoot
 
-# 5. Define scheduled task trigger: At User Logon
+# 4. Define scheduled task trigger: At User Logon
 $Trigger = New-ScheduledTaskTrigger -AtLogOn
 
-# 6. Define settings: Restart on failure, don't stop on battery
+# 5. Define settings: Prevent duplicates, restart on failure, indefinite runtime
 $Settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit (New-TimeSpan -Days 0) `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
     -Priority 7
 
-# 7. Register the Task
+# 6. Register the Task
 Write-Host "Registering task '$TaskName'..." -ForegroundColor Cyan
 Register-ScheduledTask `
     -TaskName $TaskName `
